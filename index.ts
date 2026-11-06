@@ -182,10 +182,30 @@ export interface Notification {
 // 2. EXPRESS CONFIGURATION & HELPERS
 // ==========================================
 
-app.use(cors({
-  origin: [CLIENT_URL, "http://localhost:3000", "http://127.0.0.1:3000"],
-  credentials: true,
-}));
+const allowedOrigins = [
+  CLIENT_URL,
+  process.env.FRONTEND_URL,
+  "http://localhost:3000",
+  "http://127.0.0.1:3000",
+].filter(Boolean) as string[];
+
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      // Allow non-browser requests (tools, curl, server-to-server)
+      if (!origin) return callback(null, true);
+      if (allowedOrigins.includes(origin)) return callback(null, true);
+      if (origin.endsWith(".vercel.app") || origin.includes("localhost")) {
+        return callback(null, true);
+      }
+      return callback(null, true);
+    },
+    credentials: true,
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization", "Cookie", "Accept"],
+    exposedHeaders: ["Set-Cookie"],
+  })
+);
 
 app.use(express.json());
 
@@ -271,6 +291,50 @@ let guidesCol = db.collection<Guide>("guides");
 let notificationsCol = db.collection<Notification>("notifications");
 let usersCol = db.collection<User>("users");
 let sessionCol = db.collection("session");
+
+let dbConnected = false;
+let dbConnectingPromise: Promise<void> | null = null;
+
+async function ensureDbConnected(): Promise<void> {
+  if (dbConnected) return;
+  if (!dbConnectingPromise) {
+    dbConnectingPromise = client.connect().then(async () => {
+      db = client.db(DB_NAME);
+      scholarshipsCol = db.collection<Scholarship>("scholarships");
+      countriesCol = db.collection<Country>("countries");
+      universitiesCol = db.collection<University>("universities");
+      professorsCol = db.collection<Professor>("professors");
+      applicationsCol = db.collection<Application>("applications");
+      savedScholarshipsCol = db.collection<SavedScholarship>("saved_scholarships");
+      guidesCol = db.collection<Guide>("guides");
+      notificationsCol = db.collection<Notification>("notifications");
+      usersCol = db.collection<User>("users");
+      sessionCol = db.collection("session");
+      dbConnected = true;
+      try {
+        await seedInitialData();
+      } catch (seedErr) {
+        console.warn("Initial data seed check note:", seedErr);
+      }
+    }).catch((err) => {
+      dbConnectingPromise = null;
+      console.warn("MongoDB connection note (reconnecting on next request):", err.message || err);
+      throw err;
+    });
+  }
+  return dbConnectingPromise;
+}
+
+// Serverless-ready database connection guarantee
+app.use(async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    await ensureDbConnected();
+    next();
+  } catch (err: any) {
+    console.error("Database connection check note:", err.message || err);
+    next();
+  }
+});
 
 // ==========================================
 // 4. BETTER AUTH SESSION VERIFICATION
@@ -1726,32 +1790,16 @@ async function seedInitialData() {
   }
 }
 
-// Start Server
+// Start Server (used for local development / non-Vercel environments)
 async function startServer() {
   const server = app.listen(PORT, () => {
     console.log(`GoAbroad Express API Server running on port ${PORT}`);
     console.log(`Allowed Client URL: ${CLIENT_URL}`);
   });
 
-  // Connect to MongoDB asynchronously without blocking HTTP listener
-  client.connect()
-    .then(async () => {
+  ensureDbConnected()
+    .then(() => {
       console.log("Connected to MongoDB Database:", DB_NAME);
-      db = client.db(DB_NAME);
-
-      // Bind collection instances
-      scholarshipsCol = db.collection<Scholarship>("scholarships");
-      countriesCol = db.collection<Country>("countries");
-      universitiesCol = db.collection<University>("universities");
-      professorsCol = db.collection<Professor>("professors");
-      applicationsCol = db.collection<Application>("applications");
-      savedScholarshipsCol = db.collection<SavedScholarship>("saved_scholarships");
-      guidesCol = db.collection<Guide>("guides");
-      notificationsCol = db.collection<Notification>("notifications");
-      usersCol = db.collection<User>("users");
-      sessionCol = db.collection("session");
-
-      await seedInitialData();
     })
     .catch((err) => {
       console.warn("MongoDB connection note (offline / sandboxed mode):", err.message || err);
@@ -1760,4 +1808,11 @@ async function startServer() {
   return server;
 }
 
-startServer();
+// In local development or standalone execution, listen on PORT.
+// On Vercel, requests are handled serverlessly via the exported app.
+if (!process.env.VERCEL) {
+  startServer();
+}
+
+export default app;
+module.exports = app;
