@@ -4,6 +4,7 @@ dns.setServers(["8.8.8.8", "8.8.4.4"]);
 import express, { Request, Response, NextFunction } from "express";
 import dotenv from "dotenv";
 import cors from "cors";
+import crypto from "node:crypto";
 import { MongoClient, ServerApiVersion, ObjectId } from "mongodb";
 import { createRemoteJWKSet, jwtVerify } from "jose-cjs";
 
@@ -178,6 +179,18 @@ export interface Notification {
   createdAt: Date;
 }
 
+export interface AdminInvitation {
+  _id?: ObjectId;
+  email: string;
+  token: string;
+  role: "admin";
+  invitedBy: string;
+  status: "pending" | "accepted" | "revoked";
+  expiresAt: Date;
+  createdAt: Date;
+  acceptedAt?: Date;
+}
+
 // ==========================================
 // 2. EXPRESS CONFIGURATION & HELPERS
 // ==========================================
@@ -291,6 +304,7 @@ let guidesCol = db.collection<Guide>("guides");
 let notificationsCol = db.collection<Notification>("notifications");
 let usersCol = db.collection<User>("users");
 let sessionCol = db.collection("session");
+let adminInvitationsCol = db.collection<AdminInvitation>("admin_invitations");
 
 let dbConnected = false;
 let dbConnectingPromise: Promise<void> | null = null;
@@ -310,6 +324,7 @@ async function ensureDbConnected(): Promise<void> {
       notificationsCol = db.collection<Notification>("notifications");
       usersCol = db.collection<User>("users");
       sessionCol = db.collection("session");
+      adminInvitationsCol = db.collection<AdminInvitation>("admin_invitations");
       dbConnected = true;
       try {
         await seedInitialData();
@@ -348,6 +363,8 @@ try {
 }
 
 async function verifyBetterAuthSession(req: AuthRequest): Promise<boolean> {
+  if (req.user) return true;
+
   const authHeader = req.headers.authorization;
   let token: string | undefined;
 
@@ -366,20 +383,20 @@ async function verifyBetterAuthSession(req: AuthRequest): Promise<boolean> {
   if (!token) return false;
 
   try {
-    // 1. Direct MongoDB session verification (Fast, Native, Secure)
+    // 1. Direct MongoDB session verification (Fast, Native, Authoritative)
     const activeSession = await sessionCol.findOne({
       token: token,
       expiresAt: { $gt: new Date() },
     });
 
     if (activeSession && activeSession.userId) {
-      // Find user in `users` or `user` collection
-      const userDoc = await usersCol.findOne({
+      // Find user in `user` (Better Auth default) or `users` collection
+      const userDoc = await db.collection("user").findOne({
         $or: [
           { id: activeSession.userId },
           { _id: toObjectId(activeSession.userId) || activeSession.userId as any },
         ],
-      }) || await db.collection("user").findOne({
+      }) || await usersCol.findOne({
         $or: [
           { id: activeSession.userId },
           { _id: toObjectId(activeSession.userId) || activeSession.userId as any },
@@ -400,12 +417,21 @@ async function verifyBetterAuthSession(req: AuthRequest): Promise<boolean> {
     // 2. JWT Fallback via JWKS verification
     if (JWKS) {
       const { payload } = await jwtVerify(token, JWKS);
-      if (payload && (payload.sub || payload.userId || payload.id)) {
+      const userId = String(payload.sub || payload.userId || payload.id);
+      if (payload && userId) {
+        // Double check against database for fresh real-time role
+        const objId = toObjectId(userId);
+        const userDoc = await db.collection("user").findOne({
+          $or: [{ id: userId }, ...(objId ? [{ _id: objId }] : [])],
+        }) || await usersCol.findOne({
+          $or: [{ id: userId }, ...(objId ? [{ _id: objId }] : [])],
+        });
+
         req.user = {
-          id: String(payload.sub || payload.userId || payload.id),
-          email: String(payload.email || ""),
-          name: typeof payload.name === "string" ? payload.name : undefined,
-          role: (payload.role as any) || "student",
+          id: userId,
+          email: userDoc?.email || String(payload.email || ""),
+          name: userDoc?.name || (typeof payload.name === "string" ? payload.name : undefined),
+          role: (userDoc?.role as any) || (payload.role as any) || "student",
         };
         return true;
       }
@@ -436,6 +462,9 @@ const requireAdmin = async (req: AuthRequest, res: Response, next: NextFunction)
   }
   next();
 };
+
+// Global prefix guard: enforce requireAdmin across all /api/admin/* endpoints
+app.use("/api/admin", requireAdmin);
 
 // ==========================================
 // 5. PUBLIC APIS
@@ -801,6 +830,57 @@ app.patch("/api/users/profile", requireAuth, async (req: AuthRequest, res: Respo
   } catch (err: any) {
     return sendError(res, "Failed to update profile", 500, err);
   }
+});
+
+/**
+ * POST /api/auth/accept-admin-invite
+ * Accepts a verified invitation to elevate an authenticated user to admin
+ */
+app.post("/api/auth/accept-admin-invite", requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const { token } = req.body;
+    if (!token || typeof token !== "string") {
+      return sendError(res, "Valid invitation token is required", 400);
+    }
+
+    const invitation = await adminInvitationsCol.findOne({
+      token: token.trim(),
+      status: "pending",
+      expiresAt: { $gt: new Date() },
+    });
+
+    if (!invitation) {
+      return sendError(res, "Invalid, expired, or already used invitation token", 400);
+    }
+
+    if (invitation.email.toLowerCase() !== req.user!.email.toLowerCase()) {
+      return sendError(res, "This invitation was issued to a different email address", 403);
+    }
+
+    const userId = req.user!.id;
+    const objId = toObjectId(userId);
+    const query = {
+      $or: [{ id: userId }, ...(objId ? [{ _id: objId }] : []), { email: req.user!.email }],
+    };
+
+    await db.collection("user").updateOne(query, { $set: { role: "admin", updatedAt: new Date() } });
+    await usersCol.updateOne(query, { $set: { role: "admin", updatedAt: new Date() } }).catch(() => {});
+    await adminInvitationsCol.updateOne({ _id: invitation._id }, {
+      $set: { status: "accepted", acceptedAt: new Date() },
+    });
+
+    return sendSuccess(res, "Administrator privileges granted successfully", { role: "admin" });
+  } catch (err: any) {
+    return sendError(res, "Failed to accept administrator invitation", 500, err);
+  }
+});
+
+/**
+ * Public registration defense fallback
+ * Always returns student role instructions, rejecting any role manipulation
+ */
+app.post(["/api/auth/register", "/api/users/register", "/api/register"], (req: Request, res: Response) => {
+  return sendError(res, "Please use standard public registration. Role escalation is forbidden.", 400);
 });
 
 /**
@@ -1217,7 +1297,8 @@ app.get("/api/admin/stats", requireAdmin, async (req: AuthRequest, res: Response
       totalUniversities,
       totalCountries,
       totalProfessors,
-      totalUsers,
+      usersCount,
+      dbUserCount,
       totalApplications,
     ] = await Promise.all([
       scholarshipsCol.countDocuments(),
@@ -1226,6 +1307,7 @@ app.get("/api/admin/stats", requireAdmin, async (req: AuthRequest, res: Response
       countriesCol.countDocuments(),
       professorsCol.countDocuments(),
       usersCol.countDocuments().catch(() => 0),
+      db.collection("user").countDocuments().catch(() => 0),
       applicationsCol.countDocuments(),
     ]);
 
@@ -1235,7 +1317,7 @@ app.get("/api/admin/stats", requireAdmin, async (req: AuthRequest, res: Response
       totalUniversities,
       totalCountries,
       totalProfessors,
-      totalUsers: totalUsers || 3,
+      totalUsers: Math.max(usersCount, dbUserCount, 1),
       totalApplications,
     };
 
@@ -1404,7 +1486,21 @@ app.patch("/api/admin/scholarships/:id/verify", requireAdmin, async (req: AuthRe
  */
 app.get("/api/admin/users", requireAdmin, async (req: AuthRequest, res: Response) => {
   try {
-    const users = await usersCol.find({}).sort({ createdAt: -1 }).toArray();
+    let users = await usersCol.find({}).sort({ createdAt: -1 }).toArray();
+    if (!users || users.length === 0) {
+      const rawUsers = await db.collection("user").find({}).sort({ createdAt: -1 }).toArray();
+      users = rawUsers.map((u: any) => ({
+        id: String(u.id || u._id),
+        _id: u._id,
+        name: u.name || "",
+        email: u.email || "",
+        role: u.role || "student",
+        image: u.image,
+        emailVerified: u.emailVerified,
+        createdAt: u.createdAt || new Date(),
+        updatedAt: u.updatedAt || new Date(),
+      })) as any;
+    }
     return sendSuccess(res, "Users retrieved successfully", users);
   } catch (err: any) {
     return sendError(res, "Failed to retrieve users", 500, err);
@@ -1413,6 +1509,7 @@ app.get("/api/admin/users", requireAdmin, async (req: AuthRequest, res: Response
 
 /**
  * PATCH /api/admin/users/:id/role
+ * Only an authenticated platform administrator / Super Admin can change user roles
  */
 app.patch("/api/admin/users/:id/role", requireAdmin, async (req: AuthRequest, res: Response) => {
   try {
@@ -1421,6 +1518,10 @@ app.patch("/api/admin/users/:id/role", requireAdmin, async (req: AuthRequest, re
 
     if (!role || !["student", "admin", "user"].includes(role)) {
       return sendError(res, "Valid role ('student' | 'admin' | 'user') is required", 400);
+    }
+
+    if (req.user?.id === id && role !== "admin") {
+      return sendError(res, "Cannot demote your own administrator account", 400);
     }
 
     const objId = toObjectId(id);
@@ -1435,6 +1536,77 @@ app.patch("/api/admin/users/:id/role", requireAdmin, async (req: AuthRequest, re
     return sendSuccess(res, `User role updated to ${role}`, updated);
   } catch (err: any) {
     return sendError(res, "Failed to update user role", 500, err);
+  }
+});
+
+/**
+ * POST /api/admin/invite
+ * Create a secure admin invitation (Super Admin / Admin authorization required)
+ */
+app.post("/api/admin/invite", requireAdmin, async (req: AuthRequest, res: Response) => {
+  try {
+    const { email } = req.body;
+    if (!email || typeof email !== "string" || !email.includes("@")) {
+      return sendError(res, "A valid email address is required", 400);
+    }
+    const normalizedEmail = email.toLowerCase().trim();
+
+    // Check if user already exists with admin role
+    const existingUser = (await db.collection("user").findOne({ email: normalizedEmail })) || (await usersCol.findOne({ email: normalizedEmail }));
+    if (existingUser && existingUser.role === "admin") {
+      return sendError(res, "User with this email is already a platform administrator", 400);
+    }
+
+    const token = crypto.randomBytes(32).toString("hex");
+    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); // 7 days
+
+    const doc: AdminInvitation = {
+      email: normalizedEmail,
+      token,
+      role: "admin",
+      invitedBy: req.user!.email || req.user!.id,
+      status: "pending",
+      expiresAt,
+      createdAt: new Date(),
+    };
+
+    await adminInvitationsCol.insertOne(doc);
+
+    return sendSuccess(res, "Admin invitation generated successfully", {
+      email: normalizedEmail,
+      token,
+      expiresAt,
+      status: "pending",
+    }, 201);
+  } catch (err: any) {
+    return sendError(res, "Failed to create admin invitation", 500, err);
+  }
+});
+
+/**
+ * GET /api/admin/invitations
+ * List all admin invitations (Admin authorization required)
+ */
+app.get("/api/admin/invitations", requireAdmin, async (req: AuthRequest, res: Response) => {
+  try {
+    const invitations = await adminInvitationsCol.find({}).sort({ createdAt: -1 }).toArray();
+    return sendSuccess(res, "Admin invitations retrieved successfully", invitations);
+  } catch (err: any) {
+    return sendError(res, "Failed to retrieve invitations", 500, err);
+  }
+});
+
+/**
+ * DELETE /api/admin/invitations/:token
+ * Revoke an admin invitation (Admin authorization required)
+ */
+app.delete("/api/admin/invitations/:token", requireAdmin, async (req: AuthRequest, res: Response) => {
+  try {
+    const token = getParam(req.params.token);
+    await adminInvitationsCol.updateOne({ token }, { $set: { status: "revoked" } });
+    return sendSuccess(res, "Invitation revoked successfully");
+  } catch (err: any) {
+    return sendError(res, "Failed to revoke invitation", 500, err);
   }
 });
 
